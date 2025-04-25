@@ -10,9 +10,27 @@ import torch
 import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
+from click.core import batch
 from torch.autograd import Variable
 from tree import head_to_tree, tree_to_adj
 
+# 全局平均池化+1*1卷积核+ReLu+1*1卷积核+Sigmoid
+class SEAttention(nn.Module):
+    def __init__(self, channel, reduction=8):
+        super().__init__()
+        self.pool = nn.AdaptiveAvgPool1d(1)  # 对时间维度做池化，保留通道
+        self.fc = nn.Sequential(
+            nn.Linear(channel, channel // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(channel // reduction, channel, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        b, len, dim = x.size()  # (batch, channels, length)
+        y = self.pool(x.permute(0, 2, 1)).view(b, dim) # (batch, channels)
+        y = self.fc(y).view(b, dim, 1).permute(0, 2, 1) # (batch, channels, 1)
+        return x * y.expand_as(x)
 
 class DualGCNClassifier(nn.Module):
     def __init__(self, embedding_matrix, opt):
@@ -64,6 +82,7 @@ class GCNAbsaModel(nn.Module):
         embeddings = (self.emb, self.pos_emb, self.post_emb)
         # gcn layer
         self.gcn = GCN(opt, embeddings, opt.hidden_dim, opt.num_layers)
+        self.senet = SEAttention(opt.hidden_dim)
 
     def forward(self, inputs):
         tok, asp, pos, head, deprel, post, mask, l, adj = inputs           # unpack inputs
@@ -81,6 +100,8 @@ class GCNAbsaModel(nn.Module):
             adj_dep = inputs_to_tree_reps(head.data, tok.data, l.data)
 
         h1, h2, adj_ag = self.gcn(adj_dep, inputs)
+        h1 = self.senet(h1)
+        h2 = self.senet(h2)
         # avg pooling asp feature
         asp_wn = mask.sum(dim=1).unsqueeze(-1)                        # aspect words num
         mask = mask.unsqueeze(-1).repeat(1,1,self.opt.hidden_dim)     # mask for h
@@ -246,3 +267,9 @@ class MultiHeadAttention(nn.Module):
 
         attn = attention(query, key, mask=mask, dropout=self.dropout)
         return attn
+
+if __name__ == '__main__':
+    model = SEAttention(100)
+    x  = torch.randn(16, 38, 100)
+    y = model(x)
+    print(y.size())
