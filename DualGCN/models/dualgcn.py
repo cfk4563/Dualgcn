@@ -13,6 +13,7 @@ import torch.nn.functional as F
 from click.core import batch
 from torch.autograd import Variable
 from tree import head_to_tree, tree_to_adj
+from math import sqrt
 
 # 全局平均池化+1*1卷积核+ReLu+1*1卷积核+Sigmoid
 class SEAttention(nn.Module):
@@ -31,6 +32,141 @@ class SEAttention(nn.Module):
         y = self.pool(x.permute(0, 2, 1)).view(b, dim) # (batch, channels)
         y = self.fc(y).view(b, dim, 1).permute(0, 2, 1) # (batch, channels, 1)
         return x * y.expand_as(x)
+
+class TriangularCausalMask:
+    def __init__(self, B, L, device="cpu"):
+        mask_shape = [B, 1, L, L]
+        with torch.no_grad():
+            self._mask = torch.triu(torch.ones(mask_shape, dtype=torch.bool), diagonal=1).to(device)
+
+    @property
+    def mask(self):
+        return self._mask
+
+
+class FullAttention(nn.Module):
+    def __init__(self, mask_flag=True, factor=5, scale=None, attention_dropout=0.1, output_attention=False):
+        super(FullAttention, self).__init__()
+        self.scale = scale
+        self.mask_flag = mask_flag
+        self.output_attention = output_attention
+        self.dropout = nn.Dropout(attention_dropout)
+
+    def forward(self, queries, keys, values, attn_mask, tau=None, delta=None):
+        B, L, H, E = queries.shape
+        _, S, _, D = values.shape
+
+        scale = self.scale or 1. / sqrt(E)
+
+        scores = torch.einsum("blhe,bshe->bhls", queries, keys)
+
+        if self.mask_flag:
+            if attn_mask is None:
+                attn_mask = TriangularCausalMask(B, L, device=queries.device)
+
+            scores.masked_fill_(attn_mask.mask, -np.inf)
+
+        A = self.dropout(torch.softmax(scale * scores, dim=-1))
+        V = torch.einsum("bhls,bshd->blhd", A, values)
+
+        if self.output_attention:
+            return V.contiguous(), A
+        else:
+            return V.contiguous(), None
+
+
+class AttentionLayer(nn.Module):
+    def __init__(self, attention, d_model, n_heads, d_keys=None,
+                 d_values=None):
+        super(AttentionLayer, self).__init__()
+
+        d_keys = d_keys or (d_model // n_heads)
+        d_values = d_values or (d_model // n_heads)
+
+        self.inner_attention = attention
+        self.query_projection = nn.Linear(d_model, d_keys * n_heads)
+        self.key_projection = nn.Linear(d_model, d_keys * n_heads)
+        self.value_projection = nn.Linear(d_model, d_values * n_heads)
+        self.out_projection = nn.Linear(d_values * n_heads, d_model)
+        self.n_heads = n_heads
+
+    def forward(self, queries, keys, values, attn_mask, tau=None, delta=None):
+        B, L, _ = queries.shape
+        _, S, _ = keys.shape
+        H = self.n_heads
+
+        queries = self.query_projection(queries).view(B, L, H, -1)
+        keys = self.key_projection(keys).view(B, S, H, -1)
+        values = self.value_projection(values).view(B, S, H, -1)
+
+        out, attn = self.inner_attention(
+            queries,
+            keys,
+            values,
+            attn_mask,
+            tau=tau,
+            delta=delta
+        )
+        out = out.view(B, L, -1)
+
+        return self.out_projection(out), attn
+
+
+class EncoderLayer(nn.Module):
+    def __init__(self, attention, d_model, d_ff=None, dropout=0.1, activation="relu"):
+        super(EncoderLayer, self).__init__()
+        d_ff = d_ff or 4 * d_model
+        self.attention = attention
+        self.conv1 = nn.Conv1d(in_channels=d_model, out_channels=d_ff, kernel_size=1)
+        self.conv2 = nn.Conv1d(in_channels=d_ff, out_channels=d_model, kernel_size=1)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
+        self.activation = F.relu if activation == "relu" else F.gelu
+
+    def forward(self, x, attn_mask=None, tau=None, delta=None):
+        new_x, attn = self.attention(
+            x, x, x,
+            attn_mask=attn_mask,
+            tau=tau, delta=delta
+        )
+        x = x + self.dropout(new_x)
+
+        y = x = self.norm1(x)
+        y = self.dropout(self.activation(self.conv1(y.transpose(-1, 1))))
+        y = self.dropout(self.conv2(y).transpose(-1, 1))
+
+        return self.norm2(x + y), attn
+
+
+class Encoder(nn.Module):
+    def __init__(self, attn_layers, conv_layers=None, norm_layer=None):
+        super(Encoder, self).__init__()
+        self.attn_layers = nn.ModuleList(attn_layers)
+        self.conv_layers = nn.ModuleList(conv_layers) if conv_layers is not None else None
+        self.norm = norm_layer
+
+    def forward(self, x, attn_mask=None, tau=None, delta=None):
+        # x [B, L, D]
+        attns = []
+
+        if self.conv_layers is not None:
+            for i, (attn_layer, conv_layer) in enumerate(zip(self.attn_layers, self.conv_layers)):
+                delta = delta if i == 0 else None
+                x, attn = attn_layer(x, attn_mask=attn_mask, tau=tau, delta=delta)
+                x = conv_layer(x)
+                attns.append(attn)
+            x, attn = self.attn_layers[-1](x, tau=tau, delta=None)
+            attns.append(attn)
+        else:
+            for attn_layer in self.attn_layers:
+                x, attn = attn_layer(x, attn_mask=attn_mask, tau=tau, delta=delta)
+                attns.append(attn)
+
+        if self.norm is not None:
+            x = self.norm(x)
+
+        return x, attns
 
 class DualGCNClassifier(nn.Module):
     def __init__(self, embedding_matrix, opt):
@@ -110,6 +246,7 @@ class GCNAbsaModel(nn.Module):
         
         return outputs1, outputs2, adj_ag, adj_dep
 
+
 class GCN(nn.Module):
     def __init__(self, opt, embeddings, mem_dim, num_layers):
         super(GCN, self).__init__()
@@ -121,12 +258,29 @@ class GCN(nn.Module):
 
         # rnn layer
         input_size = self.in_dim
-        self.rnn = nn.LSTM(input_size, opt.rnn_hidden, opt.rnn_layers, batch_first=True, \
-                dropout=opt.rnn_dropout, bidirectional=opt.bidirect)
+        self.rnn = nn.LSTM(input_size, opt.rnn_hidden, opt.rnn_layers, batch_first=True, dropout=opt.rnn_dropout, bidirectional=opt.bidirect)
         if opt.bidirect:
             self.in_dim = opt.rnn_hidden * 2
         else:
             self.in_dim = opt.rnn_hidden
+
+        # transformer ecoder
+        transformer_hidden = opt.rnn_hidden * 2
+        self.projection = nn.Linear(input_size, transformer_hidden)
+        self.transformer_encoder = Encoder(
+            [
+                EncoderLayer(
+                    AttentionLayer(
+                        FullAttention(False, attention_dropout=opt.rnn_dropout,
+                                      output_attention=False), transformer_hidden, opt.attention_heads),
+                    transformer_hidden,
+                    transformer_hidden * 4,
+                    dropout=opt.rnn_dropout,
+                    activation='gelu'
+                ) for l in range(opt.rnn_layers)
+            ],
+            norm_layer=nn.LayerNorm(self.in_dim)
+        )
 
         # drop out
         self.rnn_drop = nn.Dropout(opt.rnn_dropout)
@@ -156,6 +310,13 @@ class GCN(nn.Module):
         rnn_outputs, _ = nn.utils.rnn.pad_packed_sequence(rnn_outputs, batch_first=True)
         return rnn_outputs
 
+    def encode_with_transformer(self, transformer_inputs, seq_lens):
+        transformer_inputs = nn.utils.rnn.pack_padded_sequence(transformer_inputs, seq_lens.cpu(), batch_first=True, enforce_sorted=False)
+        transformer_inputs, _ = nn.utils.rnn.pad_packed_sequence(transformer_inputs, batch_first=True)
+        transformer_inputs = self.projection(transformer_inputs)
+        transformer_outputs, attn = self.transformer_encoder(transformer_inputs)
+        return transformer_outputs
+
     def forward(self, adj, inputs):
         tok, asp, pos, head, deprel, post, mask, l, _ = inputs           # unpack inputs
         src_mask = (tok != 0).unsqueeze(-2)
@@ -174,8 +335,10 @@ class GCN(nn.Module):
 
         # rnn layer
         self.rnn.flatten_parameters()
-        gcn_inputs = self.rnn_drop(self.encode_with_rnn(embs, l, tok.size()[0]))
-        
+        # gcn_inputs = self.rnn_drop(self.encode_with_rnn(embs, l, tok.size()[0]))
+
+        gcn_inputs = self.rnn_drop(self.encode_with_transformer(embs, l))
+
         denom_dep = adj.sum(2).unsqueeze(2) + 1
         attn_tensor = self.attn(gcn_inputs, gcn_inputs, src_mask)
         attn_adj_list = [attn_adj.squeeze(1) for attn_adj in torch.split(attn_tensor, 1, dim=1)]
