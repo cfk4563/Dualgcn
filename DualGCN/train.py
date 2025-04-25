@@ -274,8 +274,8 @@ def main():
             'test': './DualGCN/dataset/Restaurants_corenlp/test.json',
         },
         'laptop': {
-            'train': './dataset/Laptops_corenlp/train.json',
-            'test': './dataset/Laptops_corenlp/test.json'
+            'train': './DualGCN/dataset/Laptops_corenlp/train.json',
+            'test': './DualGCN/dataset/Laptops_corenlp/test.json'
         },
         'twitter': {
             'train': './DualGCN/dataset/Tweets_corenlp/train.json',
@@ -342,7 +342,7 @@ def main():
     parser.add_argument('--device', default=None, type=str, help='cpu, cuda')
     parser.add_argument('--seed', default=1000, type=int)
     parser.add_argument("--weight_decay", default=0.0, type=float, help="Weight deay if we apply some.")
-    parser.add_argument('--vocab_dir', type=str, default='D:\\Desktop\\DualGCN-ABSA-main\\DualGCN-ABSA-main\\DualGCN\\dataset\\Laptops_corenlp')
+    parser.add_argument('--vocab_dir', type=str, default='./dataset/Laptops_corenlp')
     parser.add_argument('--pad_id', default=0, type=int)
     parser.add_argument('--parseadj', default=False, action='store_true', help='dependency probability')
     parser.add_argument('--parsehead', default=False, action='store_true', help='dependency tree')
@@ -380,6 +380,7 @@ def main():
 
     ins = Instructor(opt)
     ins.run()
+
 
 if __name__ == '__main__':
     main()
