@@ -3,7 +3,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
 class DynamicLSTM(nn.Module):
     '''
     LSTM which can hold variable length sequence, use like TensorFlow's RNN(input, lenght...).
