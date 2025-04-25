@@ -14,6 +14,7 @@ from torch.autograd import Variable
 from tree import head_to_tree, tree_to_adj
 
 
+
 class DualGCNClassifier(nn.Module):
     def __init__(self, embedding_matrix, opt):
         super().__init__()
